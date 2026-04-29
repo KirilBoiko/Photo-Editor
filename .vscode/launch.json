@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:photo-editor}",
+            "name": "Debug PhotoEditor",
+            "target": "PhotoEditor",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug PhotoEditor"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:photo-editor}",
+            "name": "Release PhotoEditor",
+            "target": "PhotoEditor",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release PhotoEditor"
+        }
+    ]
+}
