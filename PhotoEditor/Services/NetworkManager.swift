@@ -1,12 +1,12 @@
 import Foundation
 
 // MARK: - NetworkManager
-/// Handles communication with the Google Gemini API for AI-powered photo analysis.
+/// Handles communication with the image analysis API.
 ///
 /// Architecture:
-/// - Uses the Gemini REST API directly via `URLSession` (no Firebase/SDK dependency).
+/// - Uses the REST API directly via `URLSession`.
 /// - Sends a base64-encoded low-res JPEG thumbnail for analysis.
-/// - Uses Gemini's Structured Output (JSON Mode) with a strict `responseSchema`
+/// - Uses structured output (JSON Mode) with a strict `responseSchema`
 ///   to guarantee a valid `ImageAdjustments` response.
 /// - API key is loaded from `APIKeys.plist` in the app bundle.
 
@@ -14,7 +14,7 @@ final class NetworkManager: Sendable {
 
     // MARK: - Types
 
-    /// Errors that can occur during the Gemini API interaction.
+    /// Errors that can occur during the API interaction.
     enum NetworkError: LocalizedError {
         case missingAPIKey
         case invalidThumbnailData
@@ -27,7 +27,7 @@ final class NetworkManager: Sendable {
         var errorDescription: String? {
             switch self {
             case .missingAPIKey:
-                return "Gemini API key not found. Please add your key to APIKeys.plist."
+                return "API key not found. Please add your key to APIKeys.plist."
             case .invalidThumbnailData:
                 return "Failed to generate JPEG thumbnail data for the image."
             case .invalidURL:
@@ -46,10 +46,10 @@ final class NetworkManager: Sendable {
 
     // MARK: - Constants
 
-    /// Gemini API endpoint (v1beta required for structured output / responseSchema).
+    /// API endpoint.
     private static let baseURL = "https://generativelanguage.googleapis.com/v1beta/models"
 
-    /// Model to use. Gemini 3.1 Pro for high-quality photo analysis.
+    /// Model to use for photo analysis.
     private static let modelName = "gemini-3.1-pro-preview"
 
     /// Maximum dimension (width or height) for the thumbnail sent to the API.
@@ -58,7 +58,7 @@ final class NetworkManager: Sendable {
 
     // MARK: - API Key Loading
 
-    /// Loads the Gemini API key from `APIKeys.plist` in the app bundle.
+    /// Loads the API key from `APIKeys.plist` in the app bundle.
     ///
     /// The plist should contain a top-level dictionary with a `GEMINI_API_KEY` string entry.
     /// This file should be listed in `.gitignore` to avoid committing secrets.
@@ -86,7 +86,7 @@ final class NetworkManager: Sendable {
 
     // MARK: - Structured Output Schema
 
-    /// Builds the JSON Schema for Gemini's structured output.
+    /// Builds the JSON Schema for the structured output.
     ///
     /// The schema defines two sections:
     /// 1. Five global adjustment floats (exposure, contrast, saturation, warmth, sharpness)
@@ -141,6 +141,18 @@ final class NetworkManager: Sendable {
                     "type": "NUMBER",
                     "description": "Sharpness adjustment as a number between 0.0 and 1.0."
                 ],
+                "shadows": [
+                    "type": "NUMBER",
+                    "description": "Shadows adjustment as a number between -1.0 and 1.0."
+                ],
+                "highlights": [
+                    "type": "NUMBER",
+                    "description": "Highlights adjustment as a number between -1.0 and 1.0."
+                ],
+                "blur": [
+                    "type": "NUMBER",
+                    "description": "Gaussian blur adjustment as a number between 0.0 and 1.0."
+                ],
                 "aiColorProfiles": [
                     "type": "OBJECT",
                     "description": "Per-channel HSL adjustments for 8 color channels.",
@@ -148,7 +160,7 @@ final class NetworkManager: Sendable {
                     "required": ColorChannel.allNames
                 ]
             ],
-            "required": ["exposure", "contrast", "saturation", "warmth", "sharpness", "aiColorProfiles"]
+            "required": ["exposure", "contrast", "saturation", "warmth", "sharpness", "shadows", "highlights", "blur", "aiColorProfiles"]
         ]
 
         return [
@@ -163,20 +175,41 @@ final class NetworkManager: Sendable {
     }
 
     private static let systemInstruction: String = """
-    You are a Professional Layered Colorist.
-    MANDATORY WORKFLOW:
+    You are a Technical Master Colorist. You combine mathematical precision with artistic vision.
+    Use the provided Histogram Data as your absolute anchor. Every decision MUST be justified by the numbers.
 
-    Analyze the Subject vs the Background.
+    STEP 1: MATHEMATICAL ASSESSMENT (Use the HISTOGRAM DATA below)
+    - If Shadow Clipping > 5%, your FIRST priority is 'subject.shadows' or 'global.shadows' to recover detail.
+    - If Highlight Clipping > 5%, use 'background.highlights' or 'global.highlights' to pull back blown areas.
+    - If Mean Brightness < 0.3, you MUST lift Exposure. If > 0.7, you MUST reduce it.
+    - If Color Balance shows R/G/B deviation > 10% from equal (0.33), apply Warmth correction.
+    - "DO NO HARM": if Contrast Score is < 0.01, the image has very low dynamic range — use minimal values.
 
-    If there is a lighting difference (e.g., subject is darker than sky), you MUST use the 'subject' and 'background' blocks independently.
+    STEP 2: SUBJECT OPTIMIZATION (THE HERO)
+    Use 'subject.shadows' (+0.05 to +0.15) and 'subject.exposure' to make the subject the focal point.
+    Protect skin: Orange/Red Saturation must stay within ±0.03. Use Orange Luminance for glow.
 
-    Do not rely solely on 'global'. Use 'global' only for basic white balance.
+    STEP 3: BACKGROUND & DEPTH (THE STAGE)
+    Use 'background.highlights' (-0.1) to recover skies.
+    THE SEPARATION RULE: If you brighten the subject, you MUST subtly darken or cool the background ('background.warmth' -0.05) to create 3D Pop.
+    BOKEH: If the background is busy, use 'background.blur' (0.0 to 0.5) to soften it.
 
-    For the Golden Gate photo (or similar): Boost 'subject.exposure' (+0.2) and drop 'background.exposure' (-0.1) to create depth.
+    STEP 4: GLOBAL HARMONY
+    Use 'global' only for final white balance and tiny contrast tweaks.
+    Balance the math against the visual mood — do not over-correct a warm sunset just because the color balance is off-center.
 
-    If a subject is detected, provide distinct values for its HSL profile (e.g., warmer skin for subject, cooler blues for background).
+    SENSITIVITY HARD CAPS:
+    Contrast: MAX ±0.03 (Extreme sensitivity).
+    Global Exposure: MAX ±0.12.
+    Sharpness: MAX 0.05.
 
-    STRICT SCHEMA: { "global": {...}, "subject": {...}, "background": {...} }
+    RETURN: STRICT JSON following the nested {global, subject, background} schema.
+
+    STRICT JSON OUTPUT RULES:
+    - You MUST return a fully valid, parseable JSON object.
+    - DO NOT abbreviate. If you include a layer, you must write out the full "aiColorProfiles" object.
+    - TO SAVE TOKENS: If you do not need to edit the 'subject' or 'background', completely OMIT those blocks from your JSON. Only return the "global" block.
+    - Never return truncated text.
     """
 
     // MARK: - Public API
@@ -186,14 +219,17 @@ final class NetworkManager: Sendable {
     /// This method:
     /// 1. Loads the API key from `APIKeys.plist` or environment
     /// 2. Encodes the thumbnail JPEG as base64
-    /// 3. Sends it to Gemini with a structured output schema
+    /// 3. Sends it to the API with a structured output schema
     /// 4. Parses and returns the `ImageAdjustments`
     ///
-    /// - Parameter thumbnailData: JPEG data of a low-resolution thumbnail (≤512px).
-    ///   Generate this from `PhotoDocument.thumbnailJPEGData()`.
+    /// - Parameters:
+    ///   - thumbnailData: JPEG data of a low-resolution thumbnail (≤512px).
+    ///     Generate this from `PhotoDocument.thumbnailJPEGData()`.
+    ///   - statistics: Optional histogram-derived technical data. When provided,
+    ///     injected into the user prompt as a "Technical Truth" block.
     /// - Returns: An `ImageAdjustments` with all values clamped to -1.0...1.0.
     /// - Throws: `NetworkError` if the API call fails at any stage.
-    static func analyzePhoto(thumbnailData: Data) async throws -> ImageAdjustments {
+    static func analyzePhoto(thumbnailData: Data, statistics: ImageStatistics? = nil) async throws -> ImageAdjustments {
         // 1. Load the API key
         let apiKey = try loadAPIKey()
 
@@ -213,7 +249,8 @@ final class NetworkManager: Sendable {
         // 4. Build the request body with structured output schema
         let requestBody = buildRequestBody(
             base64Image: base64Image,
-            systemPrompt: systemInstruction
+            systemPrompt: systemInstruction,
+            statistics: statistics
         )
 
         // 5. Serialize to JSON
@@ -228,39 +265,115 @@ final class NetworkManager: Sendable {
 
         // 7. Execute the request
         let (data, response) = try await URLSession.shared.data(for: request)
+        return try parseGeminiResponse(data: data)
+    }
 
-        // 8. Validate the HTTP response
+    static func analyzeBatch(activeData: Data, contextThumbnails: [String]) async throws -> [ImageAdjustments] {
+        let apiKey = try loadAPIKey()
+        let base64Image = activeData.base64EncodedString()
+        guard !base64Image.isEmpty else { throw NetworkError.invalidThumbnailData }
+        
+        guard let url = URL(string: "\(baseURL)/\(modelName):generateContent?key=\(apiKey)") else {
+            throw NetworkError.invalidURL
+        }
+
+        var parts: [[String: Any]] = []
+        parts.append(["text": "Analyze the active image and the context of the session (thumbnails). Provide a consistent professional grade for the entire batch. Return a JSON array of ImageAdjustments. Active Image:"])
+        parts.append(["inline_data": ["mime_type": "image/jpeg", "data": base64Image]])
+        
+        for (i, thumb) in contextThumbnails.enumerated() {
+            parts.append(["text": "Context Image \(i+1):"])
+            parts.append(["inline_data": ["mime_type": "image/jpeg", "data": thumb]])
+        }
+
+        let requestBody: [String: Any] = [
+            "system_instruction": [
+                "parts": [["text": systemInstruction]]
+            ],
+            "contents": [["parts": parts]],
+            "generationConfig": [
+                "response_mime_type": "application/json",
+                "response_schema": [
+                    "type": "ARRAY",
+                    "items": adjustmentsResponseSchema()
+                ],
+                "temperature": 0.2,
+                "max_output_tokens": 8192
+            ]
+        ]
+
+        let jsonData = try JSONSerialization.data(withJSONObject: requestBody, options: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = jsonData
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw NetworkError.unexpectedResponseStructure("Response is not HTTP.")
+            throw NetworkError.decodingError("Invalid HTTP response.")
+        }
+        guard httpResponse.statusCode == 200 else {
+            let errorText = String(data: data, encoding: .utf8)
+            if let text = errorText {
+                print("API ERROR: \(text)")
+            }
+            throw NetworkError.httpError(statusCode: httpResponse.statusCode, message: errorText ?? "Unknown API Error")
+        }
+        
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let candidates = json["candidates"] as? [[String: Any]],
+              let firstCandidate = candidates.first,
+              let content = firstCandidate["content"] as? [String: Any],
+              let parts = content["parts"] as? [[String: Any]],
+              let firstPart = parts.first,
+              let text = firstPart["text"] as? String else {
+            throw NetworkError.decodingError("No text in response.")
+        }
+        
+        var sanitized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if sanitized.hasPrefix("```json") { sanitized = String(sanitized.dropFirst(7)) }
+        else if sanitized.hasPrefix("```") { sanitized = String(sanitized.dropFirst(3)) }
+        if sanitized.hasSuffix("```") { sanitized = String(sanitized.dropLast(3)) }
+        sanitized = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+        sanitized = sanitized.replacingOccurrences(of: "\\.(?=[,\\s}\\]]|$)", with: ".0", options: .regularExpression)
+
+        guard let adjustmentsData = sanitized.data(using: .utf8) else {
+            throw NetworkError.decodingError("Response text is not valid UTF-8.")
         }
 
-        guard (200...299).contains(httpResponse.statusCode) else {
-            let errorBody = String(data: data, encoding: .utf8) ?? "No error details"
-            throw NetworkError.httpError(
-                statusCode: httpResponse.statusCode,
-                message: errorBody
-            )
+        guard let jsonObj = try JSONSerialization.jsonObject(with: adjustmentsData) as? [[String: Any]] else {
+            throw NetworkError.decodingError("Root JSON is not an array.")
         }
 
-        // 9. Parse the Gemini response structure
-        let adjustments = try parseGeminiResponse(data: data)
-
-        // 10. Clamp values to valid range and return
-        return adjustments.clamped()
+        var results: [ImageAdjustments] = []
+        let decoder = JSONDecoder()
+        for dict in jsonObj {
+            let dictData = try JSONSerialization.data(withJSONObject: dict)
+            results.append(try decoder.decode(ImageAdjustments.self, from: dictData).clamped())
+        }
+        return results
     }
 
     // MARK: - Request Building
 
-    /// Constructs the full JSON request body for the Gemini generateContent API.
+    /// Constructs the full JSON request body for the generateContent API.
     ///
-    /// The structure follows the Gemini REST API specification:
+    /// The structure follows the REST API specification:
     /// - `system_instruction`: System-level prompt for consistent behavior
     /// - `contents`: User message with text prompt + inline image data
     /// - `generationConfig`: Enforces JSON output with our schema
     private static func buildRequestBody(
         base64Image: String,
-        systemPrompt: String
+        systemPrompt: String,
+        statistics: ImageStatistics? = nil
     ) -> [String: Any] {
+        // Build the user prompt text, optionally enriched with histogram data
+        var userPrompt = "Analyze this photograph and provide the optimal adjustment values to enhance it."
+        if let stats = statistics {
+            userPrompt += "\n\n" + stats.aiPromptBlock
+        }
+
         return [
             // System instruction — sets the model's persona
             "system_instruction": [
@@ -269,12 +382,12 @@ final class NetworkManager: Sendable {
                 ]
             ],
 
-            // User content — the image to analyze + a brief user prompt
+            // User content — the image to analyze + technical data + a brief user prompt
             "contents": [
                 [
                     "parts": [
                         [
-                            "text": "Analyze this photograph and provide the optimal adjustment values to enhance it."
+                            "text": userPrompt
                         ],
                         [
                             "inline_data": [
@@ -289,21 +402,21 @@ final class NetworkManager: Sendable {
             // Generation config — enforces structured JSON output
             // NOTE: The REST API uses snake_case keys, NOT camelCase.
             // Using camelCase (e.g. "responseMimeType") is silently ignored,
-            // causing Gemini to return markdown-wrapped JSON instead of raw JSON.
+            // causing the API to return markdown-wrapped JSON instead of raw JSON.
             "generationConfig": [
                 "response_mime_type": "application/json",
                 "response_schema": adjustmentsResponseSchema(),
                 "temperature": 0.2,  // Low temperature for consistent, predictable results
-                "max_output_tokens": 2048  // Larger response for layered output
+                "max_output_tokens": 8192  // Larger response for layered output
             ]
         ]
     }
 
     // MARK: - Response Parsing
 
-    /// Parses the Gemini API response and extracts `ImageAdjustments`.
+    /// Parses the API response and extracts `ImageAdjustments`.
     ///
-    /// Gemini's response structure:
+    /// The response structure:
     /// ```json
     /// {
     ///   "candidates": [{
@@ -319,7 +432,7 @@ final class NetworkManager: Sendable {
     /// The `text` field contains the JSON string matching our schema, which
     /// we decode into `ImageAdjustments`.
     private static func parseGeminiResponse(data: Data) throws -> ImageAdjustments {
-        // Parse the top-level Gemini response
+        // Parse the top-level response
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw NetworkError.unexpectedResponseStructure("Response is not a JSON object.")
         }
@@ -365,7 +478,7 @@ final class NetworkManager: Sendable {
         // Final trim after stripping fences
         sanitized = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Fix invalid decimals from AI (e.g. "exposure": 0. instead of 0.0)
+        // Fix invalid decimals (e.g. "exposure": 0. instead of 0.0)
         // Replaces any dot that is followed by a comma, space, closing brace, bracket, or string end with ".0"
         sanitized = sanitized.replacingOccurrences(
             of: "\\.(?=[,\\s}\\]]|$)",
@@ -373,33 +486,7 @@ final class NetworkManager: Sendable {
             options: .regularExpression
         )
 
-        // Robust JSON Repair step: if the model hit the token limit and cut off
-        var openBraces = sanitized.filter { $0 == "{" }.count
-        var closeBraces = sanitized.filter { $0 == "}" }.count
-        
-        if openBraces > closeBraces {
-            print("WARNING: Gemini response appears truncated. Applying robust JSON repair...")
-            
-            // Clean up any trailing comma, incomplete key/value pairs before closing
-            // Remove trailing commas
-            while sanitized.hasSuffix(",") || sanitized.hasSuffix(" ") || sanitized.hasSuffix("\n") {
-                sanitized.removeLast()
-            }
-            
-            // If we cut off mid-key or mid-value (e.g. ending in a quote or colon), 
-            // the safest bet is to strip back to the last valid separator
-            if sanitized.hasSuffix("\"") || sanitized.hasSuffix(":") {
-                if let lastComma = sanitized.lastIndex(of: ",") {
-                    sanitized = String(sanitized[..<lastComma])
-                }
-            }
-            
-            // Append missing closing braces
-            while openBraces > closeBraces {
-                sanitized += "}"
-                closeBraces += 1
-            }
-        }
+        // Robust JSON Repair removed as requested
 
         // Debug logging
         print("RAW JSON: \(text)")

@@ -18,14 +18,21 @@ struct ContentView: View {
     @State private var isDragTargeted: Bool = false
 
     var body: some View {
-        HSplitView {
-            // Left: Image Canvas
-            imageCanvas
-                .frame(minWidth: 500)
-                .layoutPriority(1)
+        VStack(spacing: 0) {
+            HSplitView {
+                // Left: Image Canvas
+                imageCanvas
+                    .frame(minWidth: 500)
+                    .layoutPriority(1)
 
-            // Right: Adjustment Panel
-            AdjustmentPanelView(viewModel: viewModel)
+                // Right: Adjustment Panel
+                AdjustmentPanelView(viewModel: viewModel)
+            }
+            
+            if !viewModel.photoQueue.isEmpty {
+                Divider()
+                FilmstripView(viewModel: viewModel)
+            }
         }
         .toolbar {
             ToolbarView(viewModel: viewModel)

@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - AdjustmentPanelView
 /// A vertical panel containing:
 /// 1. **Manual Sliders** — Exposure, Contrast, Saturation, Warmth, Sharpness
-/// 2. **AI Color Tones** — 8 toggleable color chips (appears after AI analysis)
+/// 2. **Color Mixer** — 8 toggleable color chips with HSL controls
 
 struct AdjustmentPanelView: View {
     @ObservedObject var viewModel: PhotoEditorViewModel
@@ -114,6 +114,29 @@ struct AdjustmentPanelView: View {
                     value: viewModel.binding(for: \.sharpness),
                     color: .blue
                 )
+
+                adjustmentSlider(
+                    title: "Highlights",
+                    systemImage: "sun.max",
+                    value: viewModel.binding(for: \.highlights),
+                    color: .orange
+                )
+
+                adjustmentSlider(
+                    title: "Shadows",
+                    systemImage: "moon.fill",
+                    value: viewModel.binding(for: \.shadows),
+                    color: .indigo
+                )
+
+                if viewModel.selectedLayer == .background {
+                    adjustmentSlider(
+                        title: "Bokeh",
+                        systemImage: "camera.aperture",
+                        value: viewModel.binding(for: \.blur),
+                        color: .green
+                    )
+                }
 
                 // MARK: - Color Mixer
                 Divider()

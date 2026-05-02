@@ -7,8 +7,7 @@ struct PhotoDocument {
     let originalImage: NSImage
     let ciImage: CIImage
     
-    // NEW: This fixes the "no member displayName" error
-    // It takes "photo.jpg" and turns it into just "photo"
+    /// File name without extension.
     var displayName: String {
         fileURL.deletingPathExtension().lastPathComponent
     }
@@ -23,13 +22,11 @@ struct PhotoDocument {
     init(url: URL) throws {
         self.fileURL = url
         
-        // 1. Load the NSImage from the disk
         guard let nsImage = NSImage(contentsOf: url) else {
             throw PhotoDocumentError.failedToLoadImage(url.lastPathComponent)
         }
         self.originalImage = nsImage
         
-        // 2. Use our Extension to create the CIImage for GPU processing
         guard let ci = nsImage.orientedCIImage() else {
             throw PhotoDocumentError.failedToLoadImage(url.lastPathComponent)
         }

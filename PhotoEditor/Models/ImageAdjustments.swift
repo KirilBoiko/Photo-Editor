@@ -1,8 +1,8 @@
 import Foundation
 
 // MARK: - ColorProfile
-/// Per-channel HSL adjustment values returned by the Gemini AI.
-/// All properties are optional to handle cases where the AI omits a value.
+/// Per-channel HSL adjustment values.
+/// All properties are optional to allow partial updates.
 
 struct ColorProfile: Codable, Equatable {
     /// Hue rotation for this color channel (-1.0 ... 1.0).
@@ -55,6 +55,9 @@ struct LayerAdjustments: Codable, Equatable {
     let saturation: Double?
     let warmth: Double?
     let sharpness: Double?
+    let shadows: Double?
+    let highlights: Double?
+    let blur: Double?
     let aiColorProfiles: [String: ColorProfile]?
 
     init(
@@ -63,6 +66,9 @@ struct LayerAdjustments: Codable, Equatable {
         saturation: Double? = nil,
         warmth: Double? = nil,
         sharpness: Double? = nil,
+        shadows: Double? = nil,
+        highlights: Double? = nil,
+        blur: Double? = nil,
         aiColorProfiles: [String: ColorProfile]? = nil
     ) {
         self.exposure = exposure
@@ -70,11 +76,15 @@ struct LayerAdjustments: Codable, Equatable {
         self.saturation = saturation
         self.warmth = warmth
         self.sharpness = sharpness
+        self.shadows = shadows
+        self.highlights = highlights
+        self.blur = blur
         self.aiColorProfiles = aiColorProfiles
     }
 
     enum CodingKeys: String, CodingKey {
         case exposure, contrast, saturation, warmth, sharpness
+        case shadows, highlights, blur
         case aiColorProfiles
     }
 
@@ -85,11 +95,15 @@ struct LayerAdjustments: Codable, Equatable {
     var resolvedSaturation: Float { Float(saturation ?? 0.0) }
     var resolvedWarmth: Float { Float(warmth ?? 0.0) }
     var resolvedSharpness: Float { Float(sharpness ?? 0.0) }
+    var resolvedShadows: Float { Float(shadows ?? 0.0) }
+    var resolvedHighlights: Float { Float(highlights ?? 0.0) }
+    var resolvedBlur: Float { Float(blur ?? 0.0) }
 
     // MARK: - Identity
 
     static let identity = LayerAdjustments(
         exposure: 0.0, contrast: 0.0, saturation: 0.0, warmth: 0.0, sharpness: 0.0,
+        shadows: 0.0, highlights: 0.0, blur: 0.0,
         aiColorProfiles: nil
     )
 
@@ -109,6 +123,9 @@ struct LayerAdjustments: Codable, Equatable {
             saturation: min(max(saturation ?? 0.0, -1.0), 1.0),
             warmth: min(max(warmth ?? 0.0, -1.0), 1.0),
             sharpness: min(max(sharpness ?? 0.0, -1.0), 1.0),
+            shadows: min(max(shadows ?? 0.0, -1.0), 1.0),
+            highlights: min(max(highlights ?? 0.0, -1.0), 1.0),
+            blur: min(max(blur ?? 0.0, -1.0), 1.0),
             aiColorProfiles: clampedProfiles
         )
     }
@@ -117,13 +134,55 @@ struct LayerAdjustments: Codable, Equatable {
     var isIdentity: Bool {
         resolvedExposure == 0.0 && resolvedContrast == 0.0 &&
         resolvedSaturation == 0.0 && resolvedWarmth == 0.0 && resolvedSharpness == 0.0 &&
+        resolvedShadows == 0.0 && resolvedHighlights == 0.0 && resolvedBlur == 0.0 &&
         (aiColorProfiles == nil || aiColorProfiles!.values.allSatisfy { $0.isIdentity })
+    }
+}
+
+// MARK: - ImageStatistics
+/// Precise histogram-derived technical data computed from the source image.
+/// Used to anchor enhancement decisions in measurable data.
+
+struct ImageStatistics: Codable, Equatable {
+    /// Average luminance of the image (0.0 = black, 1.0 = white). Target: ~0.5.
+    let meanBrightness: Double
+
+    /// Luminance variance — a measure of tonal range / contrast.
+    let contrastScore: Double
+
+    /// Percentage of pixels in the 0.0–0.05 luminance range (blocked blacks).
+    let shadowClipping: Double
+
+    /// Percentage of pixels in the 0.95–1.0 luminance range (blown highlights).
+    let highlightClipping: Double
+
+    /// Average R, G, B channel ratios (each 0.0–1.0). Used to detect color casts.
+    let colorBalance: [String: Double]
+
+    /// Human-readable summary for console debugging.
+    var debugDescription: String {
+        String(format: "📊 Analysis: Brightness %.3f, Contrast %.4f, Clipping S:%.1f%% H:%.1f%%, Balance R:%.2f G:%.2f B:%.2f",
+               meanBrightness, contrastScore,
+               shadowClipping * 100, highlightClipping * 100,
+               colorBalance["red"] ?? 0, colorBalance["green"] ?? 0, colorBalance["blue"] ?? 0)
+    }
+
+    /// Formats the stats into a structured block for the enhancement prompt.
+    var aiPromptBlock: String {
+        """
+        HISTOGRAM DATA FOR CURRENT FRAME:
+        - Mean Brightness: \(String(format: "%.3f", meanBrightness)) (Target: 0.5)
+        - Contrast Score: \(String(format: "%.4f", contrastScore))
+        - Shadow Clipping: \(String(format: "%.1f", shadowClipping * 100))% (High values indicate blocked blacks)
+        - Highlight Clipping: \(String(format: "%.1f", highlightClipping * 100))% (High values indicate blown skies)
+        - Color Balance: R=\(String(format: "%.3f", colorBalance["red"] ?? 0)) G=\(String(format: "%.3f", colorBalance["green"] ?? 0)) B=\(String(format: "%.3f", colorBalance["blue"] ?? 0))
+        """
     }
 }
 
 // MARK: - ImageAdjustments
 /// Top-level model containing up to three independent editing layers.
-/// The AI can populate all three; the user can edit them via the layer picker.
+/// All three can be populated programmatically; the user edits them via the layer picker.
 
 struct ImageAdjustments: Codable, Equatable {
     /// Always-present base layer.

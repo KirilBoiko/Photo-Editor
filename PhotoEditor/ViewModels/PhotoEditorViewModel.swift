@@ -4,7 +4,7 @@ import Combine
 
 // MARK: - PhotoEditorViewModel
 /// Central coordinator for the photo editor, managing state, user actions,
-/// and the pipeline from image import → AI analysis → CIFilter rendering → export.
+/// and the pipeline from image import → analysis → CIFilter rendering → export.
 ///
 /// Marked `@MainActor` because all `@Published` properties drive SwiftUI views.
 /// Heavy work (GPU rendering, network calls) is dispatched off the main thread
@@ -15,7 +15,20 @@ final class PhotoEditorViewModel: ObservableObject {
 
     // MARK: - Published State
 
-    /// The loaded photo document (nil until user imports a JPEG).
+    enum BatchState {
+        case idle, processing, completed
+    }
+
+    @Published var photoQueue: [PhotoAsset] = []
+    @Published var selectedIndex: Int = 0 {
+        didSet {
+            loadSelectedPhoto()
+        }
+    }
+    @Published var batchState: BatchState = .idle
+    @Published var batchProgress: String = ""
+
+    /// The active loaded photo document.
     @Published var document: PhotoDocument?
 
     /// The original image for display in the "Before" side.
@@ -23,6 +36,7 @@ final class PhotoEditorViewModel: ObservableObject {
 
     /// The processed image for display in the "After" side.
     @Published var processedImage: NSImage?
+
 
     enum LayerType: String, CaseIterable, Identifiable {
         case global = "Global"
@@ -37,11 +51,16 @@ final class PhotoEditorViewModel: ObservableObject {
         var saturation: Float = 0.0
         var warmth: Float = 0.0
         var sharpness: Float = 0.0
+        var shadows: Float = 0.0
+        var highlights: Float = 0.0
+        var blur: Float = 0.0
         var colorProfiles: [String: UIProfile] = PhotoEditorViewModel.defaultColorProfiles
 
         var isIdentity: Bool {
             exposure == 0 && contrast == 0 && saturation == 0 &&
-            warmth == 0 && sharpness == 0 && colorProfiles == PhotoEditorViewModel.defaultColorProfiles
+            warmth == 0 && sharpness == 0 &&
+            shadows == 0 && highlights == 0 && blur == 0 &&
+            colorProfiles == PhotoEditorViewModel.defaultColorProfiles
         }
 
         func toLayerAdjustments() -> LayerAdjustments {
@@ -52,6 +71,9 @@ final class PhotoEditorViewModel: ObservableObject {
                 saturation: Double(saturation),
                 warmth: Double(warmth),
                 sharpness: Double(sharpness),
+                shadows: Double(shadows),
+                highlights: Double(highlights),
+                blur: Double(blur),
                 aiColorProfiles: mappedProfiles
             )
         }
@@ -62,6 +84,9 @@ final class PhotoEditorViewModel: ObservableObject {
             if let sat = layerAdjustments.saturation { self.saturation = Float(sat) }
             if let wrm = layerAdjustments.warmth { self.warmth = Float(wrm) }
             if let shp = layerAdjustments.sharpness { self.sharpness = Float(shp) }
+            if let shd = layerAdjustments.shadows { self.shadows = Float(shd) }
+            if let hlt = layerAdjustments.highlights { self.highlights = Float(hlt) }
+            if let blr = layerAdjustments.blur { self.blur = Float(blr) }
             
             if let profiles = layerAdjustments.aiColorProfiles {
                 for (channel, profile) in profiles {
@@ -110,7 +135,7 @@ final class PhotoEditorViewModel: ObservableObject {
     /// Real-time histogram data extracted from the rendering pipeline
     @Published var histogramData: ProcessingEngine.HistogramData = .empty
 
-    /// True while the Gemini API call is in flight.
+    /// True while the enhancement analysis is in flight.
     @Published var isAnalyzing: Bool = false
 
     /// User-facing error message.
@@ -185,6 +210,176 @@ final class PhotoEditorViewModel: ObservableObject {
     }
 
     /// Loads a photo from a file URL.
+    
+    // MARK: - Batch & Sync
+
+    func selectPhoto(at index: Int) {
+        guard index >= 0 && index < photoQueue.count else { return }
+        // Save current adjustments to queue
+        if document != nil {
+            photoQueue[selectedIndex].adjustments = currentAdjustments
+        }
+        selectedIndex = index
+    }
+
+    private func loadSelectedPhoto() {
+        guard photoQueue.indices.contains(selectedIndex) else {
+            document = nil
+            originalImage = nil
+            processedImage = nil
+            resetAdjustments()
+            isMaskAvailable = false
+            return
+        }
+
+        let asset = photoQueue[selectedIndex]
+        document = asset.document
+        originalImage = asset.document.originalImage
+        processedImage = asset.document.originalImage
+        
+        if let adj = asset.adjustments {
+            applyAIAdjustments(adj, animate: false)
+        } else {
+            resetAdjustments()
+        }
+
+        isMaskAvailable = asset.isMaskAvailable
+        processingEngine.cachedSubjectMask = asset.cachedSubjectMask
+    }
+
+    func syncSettings() {
+        guard !photoQueue.isEmpty else { return }
+        let currentAdj = currentAdjustments
+        
+        for i in photoQueue.indices {
+            if i != selectedIndex {
+                photoQueue[i].adjustments = currentAdj
+            }
+        }
+        // Force a re-render by updating queue
+        photoQueue = photoQueue
+    }
+
+    var batchTask: Task<Void, Never>?
+
+    func cancelBatch() {
+        batchTask?.cancel()
+        batchState = .idle
+    }
+
+    func batchEnhance() {
+        guard !photoQueue.isEmpty, batchState == .idle else { return }
+        batchState = .processing
+        
+        batchTask = Task {
+            defer { 
+                Task { @MainActor in 
+                    if self.batchState == .processing { self.batchState = .completed }
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if self.batchState == .completed { self.batchState = .idle }
+                }
+            }
+            
+            do {
+                if photoQueue.count <= 5 {
+                    await MainActor.run { self.batchProgress = "[1/1] Enhancing Batch..." }
+                    let activeData = try photoQueue[selectedIndex].document.thumbnailJPEGData()
+                    var contextThumbnails: [String] = []
+                    for (i, asset) in photoQueue.enumerated() {
+                        if i != selectedIndex {
+                            if let data = try? asset.document.thumbnailJPEGData() {
+                                contextThumbnails.append(data.base64EncodedString())
+                            }
+                        }
+                    }
+                    
+                    let results = try await NetworkManager.analyzeBatch(activeData: activeData, contextThumbnails: contextThumbnails)
+                    if Task.isCancelled { return }
+                    
+                    await MainActor.run {
+                        for (i, adj) in results.enumerated() {
+                            if i < self.photoQueue.count {
+                                self.photoQueue[i].adjustments = adj
+                            }
+                        }
+                        self.loadSelectedPhoto()
+                    }
+                } else {
+                    for (i, asset) in photoQueue.enumerated() {
+                        if Task.isCancelled { break }
+                        await MainActor.run { self.batchProgress = "[\(i+1)/\(photoQueue.count)] Enhancing..." }
+                        
+                        let data = try asset.document.thumbnailJPEGData()
+                        do {
+                            let adj = try await NetworkManager.analyzePhoto(thumbnailData: data)
+                            await MainActor.run {
+                                self.photoQueue[i].adjustments = adj
+                                if i == self.selectedIndex {
+                                    self.loadSelectedPhoto()
+                                }
+                            }
+                        } catch {
+                            print("Failed to enhance photo \(i): \(error)")
+                        }
+                    }
+                }
+            } catch {
+                if !Task.isCancelled {
+                    await MainActor.run { showError("Batch failed: \(error.localizedDescription)") }
+                }
+            }
+        }
+    }
+
+    func importFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Photos"
+        panel.allowedContentTypes = [.jpeg]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+
+        Task {
+            var assets: [PhotoAsset] = []
+            for url in panel.urls {
+                if let doc = try? PhotoDocument(url: url) {
+                    assets.append(PhotoAsset(document: doc))
+                }
+            }
+            await MainActor.run {
+                self.photoQueue = assets
+                self.selectPhoto(at: 0)
+            }
+            
+            // Parallel mask generation using TaskGroup
+            await withTaskGroup(of: (Int, CIImage?).self) { group in
+                for (index, asset) in assets.enumerated() {
+                    group.addTask {
+                        let mask = try? await ProcessingEngine().generateSubjectMask(from: asset.document.ciImage)
+                        return (index, mask)
+                    }
+                }
+                
+                for await (index, mask) in group {
+                    if let mask = mask {
+                        await MainActor.run {
+                            if index < self.photoQueue.count {
+                                self.photoQueue[index].isMaskAvailable = true
+                                self.photoQueue[index].cachedSubjectMask = mask
+                                if self.selectedIndex == index {
+                                    self.isMaskAvailable = true
+                                    self.processingEngine.cachedSubjectMask = mask
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
     func loadPhoto(from url: URL) {
         do {
             let doc = try PhotoDocument(url: url)
@@ -208,27 +403,23 @@ final class PhotoEditorViewModel: ObservableObject {
         }
     }
 
-    /// Applies AI-recommended adjustments from Gemini across all layers.
-    func applyAIAdjustments(_ adjustments: ImageAdjustments) {
-        globalSliders.update(from: adjustments.global)
-        
-        if let subject = adjustments.subject {
-            subjectSliders.update(from: subject)
+    /// Applies recommended adjustments across all layers.
+    func applyAIAdjustments(_ adjustments: ImageAdjustments, animate: Bool = true) {
+        let action = {
+            self.globalSliders.update(from: adjustments.global)
+            if let subject = adjustments.subject { self.subjectSliders.update(from: subject) }
+            if let background = adjustments.background { self.backgroundSliders.update(from: background) }
         }
-        
-        if let background = adjustments.background {
-            backgroundSliders.update(from: background)
+        if animate {
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { action() }
+        } else {
+            action()
         }
-        
-        // Explicitly printing the mapping as requested
-        print("AI returned subject exposure: \(adjustments.subject?.exposure ?? 0.0)")
-        print("AI returned background exposure: \(adjustments.background?.exposure ?? 0.0)")
-        
-        print("Applying AI Layered Adjustments")
         processingEngine.clearLUTCache()
     }
 
-    /// Sends the photo thumbnail to the Gemini API for AI analysis.
+    /// Runs the enhancement pipeline: computes histogram statistics,
+    /// then sends them alongside a thumbnail for analysis.
     func autoEnhance() {
         guard let document = document else {
             showError("Please open a photo first.")
@@ -244,13 +435,20 @@ final class PhotoEditorViewModel: ObservableObject {
             defer { isAnalyzing = false }
 
             do {
+                // 1. Compute mathematical analysis from the source image
+                let stats = await processingEngine.calculateStatistics(for: document.ciImage)
+                print(stats.debugDescription)
+
+                // 2. Generate thumbnail for vision input
                 let thumbnailData = try document.thumbnailJPEGData()
 
+                // 3. Send both for analysis — statistics anchor the decisions
                 let aiAdjustments = try await NetworkManager.analyzePhoto(
-                    thumbnailData: thumbnailData
+                    thumbnailData: thumbnailData,
+                    statistics: stats
                 )
 
-                // Apply with nil-safety and smooth transition
+                // 4. Apply with nil-safety and smooth transition
                 await MainActor.run {
                     withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
                         self.applyAIAdjustments(aiAdjustments)

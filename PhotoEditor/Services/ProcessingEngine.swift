@@ -8,9 +8,9 @@ import Vision
 ///
 /// Architecture:
 /// - Creates a single `CIContext` backed by the default `MTLDevice`
-///   (the M3 GPU), ensuring all rendering uses hardware acceleration.
+///   (the system GPU), ensuring all rendering uses hardware acceleration.
 /// - **Stage 1**: Global CIFilter chain (exposure, contrast, saturation, warmth, sharpness)
-/// - **Stage 2**: Per-channel CIColorCube LUTs for AI Color Tones
+/// - **Stage 2**: Per-channel CIColorCube LUTs for Color Tones
 /// - Core Image's lazy evaluation fuses ALL stages into a single GPU pass.
 /// - All rendering happens on a dedicated background queue to keep the UI responsive.
 
@@ -36,7 +36,7 @@ final class ProcessingEngine: @unchecked Sendable {
     private static let lutDimension: Int = 64
 
     /// Cached subject mask from Vision
-    private var cachedSubjectMask: CIImage? = nil
+    var cachedSubjectMask: CIImage? = nil
 
     // MARK: - Hue Ranges
 
@@ -159,6 +159,135 @@ final class ProcessingEngine: @unchecked Sendable {
         }
     }
     
+    // MARK: - Image Statistics (Mathematical Analysis)
+    
+    /// Computes precise histogram-derived statistics from the source image.
+    /// Uses CIAreaAverage for mean brightness/color and CIAreaHistogram for clipping analysis.
+    /// Operates on a downsampled 512px version for instant performance on M3.
+    func calculateStatistics(for ciImage: CIImage) async -> ImageStatistics {
+        return await withCheckedContinuation { continuation in
+            renderQueue.async { [self] in
+                // Downsample to 512px for fast analysis
+                let scaleFilter = CIFilter(name: "CILanczosScaleTransform")!
+                let scale = min(1.0, 512.0 / max(ciImage.extent.width, ciImage.extent.height))
+                scaleFilter.setValue(ciImage, forKey: kCIInputImageKey)
+                scaleFilter.setValue(scale, forKey: kCIInputScaleKey)
+                let analysisImage = scaleFilter.outputImage ?? ciImage
+                let extent = analysisImage.extent
+                
+                // --- Mean Brightness & Color Balance via CIAreaAverage ---
+                var meanBrightness: Double = 0.5
+                var colorBalance: [String: Double] = ["red": 0.33, "green": 0.33, "blue": 0.33]
+                
+                if let avgFilter = CIFilter(name: "CIAreaAverage") {
+                    avgFilter.setValue(analysisImage, forKey: kCIInputImageKey)
+                    avgFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
+                    
+                    if let avgOutput = avgFilter.outputImage {
+                        var pixel = [Float](repeating: 0, count: 4)
+                        self.ciContext.render(
+                            avgOutput,
+                            toBitmap: &pixel,
+                            rowBytes: 4 * MemoryLayout<Float>.stride,
+                            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                            format: .RGBAf,
+                            colorSpace: nil
+                        )
+                        
+                        let r = Double(pixel[0])
+                        let g = Double(pixel[1])
+                        let b = Double(pixel[2])
+                        
+                        // ITU-R BT.709 luminance
+                        meanBrightness = r * 0.2126 + g * 0.7152 + b * 0.0722
+                        
+                        let total = max(r + g + b, 0.001)
+                        colorBalance = [
+                            "red": r / total,
+                            "green": g / total,
+                            "blue": b / total
+                        ]
+                    }
+                }
+                
+                // --- Histogram Analysis via CIAreaHistogram (256 bins) ---
+                var shadowClipping: Double = 0.0
+                var highlightClipping: Double = 0.0
+                var contrastScore: Double = 0.0
+                
+                if let histFilter = CIFilter(name: "CIAreaHistogram") {
+                    histFilter.setValue(analysisImage, forKey: kCIInputImageKey)
+                    histFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
+                    histFilter.setValue(256, forKey: "inputCount")
+                    histFilter.setValue(1.0, forKey: "inputScale")
+                    
+                    if let histOutput = histFilter.outputImage {
+                        var bins = [SIMD4<Float>](repeating: .zero, count: 256)
+                        self.ciContext.render(
+                            histOutput,
+                            toBitmap: &bins,
+                            rowBytes: 256 * MemoryLayout<SIMD4<Float>>.stride,
+                            bounds: CGRect(x: 0, y: 0, width: 256, height: 1),
+                            format: .RGBAf,
+                            colorSpace: nil
+                        )
+                        
+                        // Compute luminance histogram from RGB bins
+                        var lumBins = [Double](repeating: 0, count: 256)
+                        var totalPixels: Double = 0
+                        
+                        for i in 0..<256 {
+                            let lum = Double(bins[i].x) * 0.2126 +
+                                      Double(bins[i].y) * 0.7152 +
+                                      Double(bins[i].z) * 0.0722
+                            lumBins[i] = lum
+                            totalPixels += lum
+                        }
+                        
+                        guard totalPixels > 0 else {
+                            continuation.resume(returning: ImageStatistics(
+                                meanBrightness: meanBrightness, contrastScore: 0,
+                                shadowClipping: 0, highlightClipping: 0,
+                                colorBalance: colorBalance
+                            ))
+                            return
+                        }
+                        
+                        // Shadow clipping: bins 0–12 (~0.0–0.05 range)
+                        let shadowBins = lumBins[0..<13].reduce(0, +)
+                        shadowClipping = shadowBins / totalPixels
+                        
+                        // Highlight clipping: bins 243–255 (~0.95–1.0 range)
+                        let highlightBins = lumBins[243..<256].reduce(0, +)
+                        highlightClipping = highlightBins / totalPixels
+                        
+                        // Contrast score: variance of luminance distribution
+                        var mean: Double = 0
+                        for i in 0..<256 {
+                            mean += (Double(i) / 255.0) * (lumBins[i] / totalPixels)
+                        }
+                        var variance: Double = 0
+                        for i in 0..<256 {
+                            let diff = (Double(i) / 255.0) - mean
+                            variance += diff * diff * (lumBins[i] / totalPixels)
+                        }
+                        contrastScore = variance
+                    }
+                }
+                
+                let stats = ImageStatistics(
+                    meanBrightness: meanBrightness,
+                    contrastScore: contrastScore,
+                    shadowClipping: shadowClipping,
+                    highlightClipping: highlightClipping,
+                    colorBalance: colorBalance
+                )
+                
+                continuation.resume(returning: stats)
+            }
+        }
+    }
+    
     // MARK: - Histogram Generation
     
     /// Generates a normalized RGB and Luminance histogram using Core Image's hardware-accelerated filters.
@@ -242,6 +371,15 @@ final class ProcessingEngine: @unchecked Sendable {
                             let scaleX = ciImage.extent.width / maskImage.extent.width
                             let scaleY = ciImage.extent.height / maskImage.extent.height
                             maskImage = maskImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+                            
+                            // Feather the edges
+                            if let blurFilter = CIFilter(name: "CIGaussianBlur") {
+                                blurFilter.setValue(maskImage, forKey: kCIInputImageKey)
+                                blurFilter.setValue(1.5, forKey: kCIInputRadiusKey)
+                                if let blurred = blurFilter.outputImage {
+                                    maskImage = blurred
+                                }
+                            }
                             
                             self.cachedSubjectMask = maskImage
                             continuation.resume(returning: maskImage)
@@ -332,6 +470,9 @@ final class ProcessingEngine: @unchecked Sendable {
         let sat = adjustments.resolvedSaturation
         let wrm = adjustments.resolvedWarmth
         let shp = adjustments.resolvedSharpness
+        let shd = adjustments.resolvedShadows
+        let hlt = adjustments.resolvedHighlights
+        let blr = adjustments.resolvedBlur
 
         // 1. Exposure — CIExposureAdjust
         if exp != 0.0 {
@@ -385,6 +526,28 @@ final class ProcessingEngine: @unchecked Sendable {
             }
         }
 
+        // 5. Shadows / Highlights — CIHighlightShadowAdjust
+        if shd != 0.0 || hlt != 0.0 {
+            let hsFilter = CIFilter(name: "CIHighlightShadowAdjust")!
+            hsFilter.setValue(image, forKey: kCIInputImageKey)
+            hsFilter.setValue(Float(1.0 + hlt), forKey: "inputHighlightAmount")
+            hsFilter.setValue(Float(shd), forKey: "inputShadowAmount")
+            if let output = hsFilter.outputImage {
+                image = output
+            }
+        }
+
+        // 6. Blur (Bokeh) — CIGaussianBlur
+        if blr > 0.0 {
+            let blurFilter = CIFilter(name: "CIGaussianBlur")!
+            blurFilter.setValue(image, forKey: kCIInputImageKey)
+            blurFilter.setValue(blr * 30.0, forKey: kCIInputRadiusKey) // Scaled for visible bokeh effect
+            if let output = blurFilter.outputImage {
+                // Ensure the blurred image maintains the original extent to prevent expanding edges
+                image = output.cropped(to: image.extent)
+            }
+        }
+
         return image
     }
 
@@ -404,7 +567,7 @@ final class ProcessingEngine: @unchecked Sendable {
     ) -> CIImage {
         var result = image
         
-        // Debug print to verify which channels are actively being processed by the M3 GPU
+        // Debug print to verify which channels are actively being processed
         let enabledChannels = ColorChannel.allCases
             .filter { profiles[$0.rawValue]?.isIdentity == false }
             .map { $0.rawValue }

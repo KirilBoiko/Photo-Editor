@@ -1,7 +1,7 @@
 import SwiftUI
 
 // MARK: - PhotoEditorApp
-/// Main entry point for the AI Photo Editor macOS application.
+/// Main entry point for the Photo Editor macOS application.
 
 @main
 struct PhotoEditorApp: App {
