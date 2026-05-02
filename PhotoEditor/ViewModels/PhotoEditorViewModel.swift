@@ -138,6 +138,9 @@ final class PhotoEditorViewModel: ObservableObject {
     /// True while the enhancement analysis is in flight.
     @Published var isAnalyzing: Bool = false
 
+    /// Descriptive message shown during the analysis pipeline.
+    @Published var loadingMessage: String = ""
+
     /// User-facing error message.
     @Published var errorMessage: String?
 
@@ -429,15 +432,21 @@ final class PhotoEditorViewModel: ObservableObject {
         guard !isAnalyzing else { return }
 
         isAnalyzing = true
+        loadingMessage = "Analyzing Light Map..."
         errorMessage = nil
 
         Task {
-            defer { isAnalyzing = false }
+            defer {
+                isAnalyzing = false
+                loadingMessage = ""
+            }
 
             do {
                 // 1. Compute mathematical analysis from the source image
                 let stats = await processingEngine.calculateStatistics(for: document.ciImage)
                 print(stats.debugDescription)
+
+                await MainActor.run { self.loadingMessage = "Generating Layered Grade..." }
 
                 // 2. Generate thumbnail for vision input
                 let thumbnailData = try document.thumbnailJPEGData()
@@ -447,6 +456,8 @@ final class PhotoEditorViewModel: ObservableObject {
                     thumbnailData: thumbnailData,
                     statistics: stats
                 )
+
+                await MainActor.run { self.loadingMessage = "Applying Enhancements..." }
 
                 // 4. Apply with nil-safety and smooth transition
                 await MainActor.run {

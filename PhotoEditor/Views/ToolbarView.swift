@@ -68,8 +68,15 @@ struct ToolbarView: View {
                     .opacity(viewModel.isAnalyzing ? 0 : 1)
                 
                 if viewModel.isAnalyzing {
-                    ProgressView()
-                        .controlSize(.small)
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        if !viewModel.loadingMessage.isEmpty {
+                            Text(viewModel.loadingMessage)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
             .frame(height: 44)

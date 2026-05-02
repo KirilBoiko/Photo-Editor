@@ -53,8 +53,19 @@ final class NetworkManager: Sendable {
     private static let modelName = "gemini-3.1-pro-preview"
 
     /// Maximum dimension (width or height) for the thumbnail sent to the API.
-    /// 512px keeps the request small while providing enough detail for analysis.
-    private static let thumbnailMaxDimension: CGFloat = 512
+    /// 768px provides enough detail for color grading while keeping payload small.
+    private static let thumbnailMaxDimension: CGFloat = 768
+
+    /// Maximum retry attempts for timeout errors.
+    private static let maxRetries = 1
+
+    /// Dedicated URLSession with extended timeouts for complex analysis.
+    private static let apiSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 120
+        config.timeoutIntervalForResource = 120
+        return URLSession(configuration: config)
+    }()
 
     // MARK: - API Key Loading
 
@@ -175,61 +186,33 @@ final class NetworkManager: Sendable {
     }
 
     private static let systemInstruction: String = """
-    You are an Elite Colorist. You combine mathematical precision with spatial awareness.
-    Use the provided Histogram Data and Spatial Light Map as your absolute anchors.
+    You are an Elite Colorist. Use the provided data as anchors.
 
-    STEP 1: SPATIAL LIGHT DIAGNOSIS (Use the SPATIAL LIGHT MAP)
-    Read the 3x3 brightness grid to understand the lighting setup:
+    SPATIAL DIAGNOSIS (from the 3x3 Light Map):
+    • BACKLIT: top row >0.8 & center <0.3 → boost subject.shadows +0.2, drop background.highlights -0.15
+    • FLAT: Dynamic Range <0.15 → global.contrast +0.02, use HSL Luminance for pop
+    • UNBALANCED: L/R columns differ >0.2 → adjust global.exposure to split the difference
+    • Subject Area <0.35 → lift subject.exposure; >0.65 → protect highlights
 
-    BACKLIT DETECTION: If top zones (row 0) are >0.8 and center zones are <0.3, the subject is backlit.
-    You MUST boost 'subject.shadows' (+0.2) and drop 'background.highlights' (-0.15).
+    HISTOGRAM RULES:
+    • Shadow Clipping >5% → recover with subject/global shadows
+    • Highlight Clipping >5% → pull back with background/global highlights
+    • Mean Brightness <0.3 → lift Exposure; >0.7 → reduce it
+    • R/G/B deviation >10% from 0.33 → Warmth correction
+    • Contrast Score <0.01 → minimal values (low dynamic range)
 
-    FLAT LIGHTING: If 'Dynamic Range Depth' is <0.15, the image lacks depth.
-    Increase 'global.contrast' (+0.02) and use HSL Luminance to create subtle 'pop'.
+    SUBJECT: Use subject.shadows (+0.05 to +0.15) and subject.exposure for focal emphasis.
+    Skin protection: Orange/Red Saturation ±0.03 max. Use Orange Luminance for glow.
 
-    UNBALANCED: If one side is significantly darker than the other (left vs right columns differ by >0.2),
-    adjust 'global.exposure' to find a safe middle ground before applying layered fixes.
+    BACKGROUND: Use background.highlights (-0.1) for sky recovery.
+    If subject brightened → darken/cool background (warmth -0.05) for 3D pop.
+    Busy background → background.blur (0.0–0.5).
 
-    SUBJECT METERING: Use 'Subject Area Brightness' as your key target. If it's below 0.35, the subject
-    is underexposed — prioritize 'subject.exposure' lift. If above 0.65, protect highlights first.
+    GLOBAL: White balance and tiny contrast tweaks only. Respect visual mood.
 
-    STEP 2: HISTOGRAM VERIFICATION (Use the HISTOGRAM DATA)
-    - If Shadow Clipping > 5%, recover with 'subject.shadows' or 'global.shadows'.
-    - If Highlight Clipping > 5%, pull back with 'background.highlights' or 'global.highlights'.
-    - If Mean Brightness < 0.3, you MUST lift Exposure. If > 0.7, you MUST reduce it.
-    - If Color Balance shows R/G/B deviation > 10% from equal (0.33), apply Warmth correction.
-    - "DO NO HARM": if Contrast Score is < 0.01, the image has very low dynamic range — use minimal values.
+    HARD CAPS: Contrast ±0.03 | Exposure ±0.12 | Sharpness 0.05 max
 
-    STEP 3: SUBJECT OPTIMIZATION (THE HERO)
-    Use 'subject.shadows' (+0.05 to +0.15) and 'subject.exposure' to make the subject the focal point.
-    Protect skin: Orange/Red Saturation must stay within ±0.03. Use Orange Luminance for glow.
-
-    STEP 4: BACKGROUND & DEPTH (THE STAGE)
-    Use 'background.highlights' (-0.1) to recover skies.
-    THE SEPARATION RULE: If you brighten the subject, you MUST subtly darken or cool the background
-    ('background.warmth' -0.05) to create 3D Pop.
-    BOKEH: If the background is busy, use 'background.blur' (0.0 to 0.5) to soften it.
-
-    STEP 5: GLOBAL HARMONY
-    Use 'global' only for final white balance and tiny contrast tweaks.
-    Balance the math against the visual mood — do not over-correct a warm sunset just because
-    the color balance is off-center.
-
-    GOAL: Balance the light map so the subject area (center) feels naturally illuminated
-    relative to the background.
-
-    SENSITIVITY HARD CAPS:
-    Contrast: MAX ±0.03 (Extreme sensitivity).
-    Global Exposure: MAX ±0.12.
-    Sharpness: MAX 0.05.
-
-    RETURN: STRICT JSON following the nested {global, subject, background} schema.
-
-    STRICT JSON OUTPUT RULES:
-    - You MUST return a fully valid, parseable JSON object.
-    - DO NOT abbreviate. If you include a layer, you must write out the full "aiColorProfiles" object.
-    - TO SAVE TOKENS: If you do not need to edit the 'subject' or 'background', completely OMIT those blocks from your JSON. Only return the "global" block.
-    - Never return truncated text.
+    JSON: Return valid {global, subject?, background?}. Omit unused layers. Never truncate.
     """
 
     // MARK: - Public API
@@ -281,11 +264,10 @@ final class NetworkManager: Sendable {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = jsonData
-        request.timeoutInterval = 30
+        request.timeoutInterval = 120
 
-        // 7. Execute the request
-        let (data, response) = try await URLSession.shared.data(for: request)
-        return try parseGeminiResponse(data: data)
+        // 7. Execute with retry on timeout
+        return try await executeWithRetry(request: request)
     }
 
     static func analyzeBatch(activeData: Data, contextThumbnails: [String]) async throws -> [ImageAdjustments] {
@@ -327,8 +309,9 @@ final class NetworkManager: Sendable {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = jsonData
+        request.timeoutInterval = 120
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await apiSession.data(for: request)
         
         guard let httpResponse = response as? HTTPURLResponse else {
             throw NetworkError.decodingError("Invalid HTTP response.")
@@ -373,6 +356,20 @@ final class NetworkManager: Sendable {
             results.append(try decoder.decode(ImageAdjustments.self, from: dictData).clamped())
         }
         return results
+    }
+
+    // MARK: - Retry Logic
+
+    /// Executes a request with automatic retry on timeout.
+    /// Uses the dedicated `apiSession` with extended timeouts.
+    private static func executeWithRetry(request: URLRequest, attempt: Int = 0) async throws -> ImageAdjustments {
+        do {
+            let (data, _) = try await apiSession.data(for: request)
+            return try parseGeminiResponse(data: data)
+        } catch let error as URLError where error.code == .timedOut && attempt < maxRetries {
+            print("⏱ Request timed out (attempt \(attempt + 1)/\(maxRetries + 1)). Retrying...")
+            return try await executeWithRetry(request: request, attempt: attempt + 1)
+        }
     }
 
     // MARK: - Request Building
