@@ -141,6 +141,9 @@ final class PhotoEditorViewModel: ObservableObject {
     /// Descriptive message shown during the analysis pipeline.
     @Published var loadingMessage: String = ""
 
+    /// Last computed image statistics — exposed for UI indicators (e.g. highlight warning).
+    @Published var lastImageStatistics: ImageStatistics?
+
     /// User-facing error message.
     @Published var errorMessage: String?
 
@@ -445,6 +448,9 @@ final class PhotoEditorViewModel: ObservableObject {
                 // 1. Compute mathematical analysis from the source image
                 let stats = await processingEngine.calculateStatistics(for: document.ciImage)
                 print(stats.debugDescription)
+                print("DEBUG: Sending Zonal Map to API: \(stats.zonalBrightness)")
+
+                await MainActor.run { self.lastImageStatistics = stats }
 
                 await MainActor.run { self.loadingMessage = "Generating Layered Grade..." }
 

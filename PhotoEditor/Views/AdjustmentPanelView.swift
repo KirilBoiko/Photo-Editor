@@ -28,7 +28,24 @@ struct AdjustmentPanelView: View {
             VStack(alignment: .leading, spacing: 20) {
                 // MARK: - Histogram
                 HistogramView(data: viewModel.histogramData)
-                    .padding(.bottom, 8)
+                    .padding(.bottom, 4)
+
+                // MARK: - Highlight Warning
+                if let stats = viewModel.lastImageStatistics,
+                   stats.highlightClipping > 0.02 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sun.max.trianglefill")
+                            .foregroundStyle(.orange)
+                            .font(.system(size: 12))
+                        Text("Highlights Clipping (\(String(format: "%.1f", stats.highlightClipping * 100))%) — Recovery Mode")
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.orange)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.bottom, 4)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
                 
                 // MARK: - Layer Picker
                 VStack(spacing: 8) {
