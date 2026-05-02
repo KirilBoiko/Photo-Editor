@@ -159,23 +159,49 @@ struct ImageStatistics: Codable, Equatable {
     /// Average R, G, B channel ratios (each 0.0–1.0). Used to detect color casts.
     let colorBalance: [String: Double]
 
+    /// 3x3 grid of local brightness values (left-to-right, top-to-bottom).
+    /// Each value is the average luminance of that zone (0.0–1.0).
+    let zonalBrightness: [Double]
+
+    /// Max zone brightness minus min zone brightness. Measures spatial contrast.
+    let dynamicRangeDepth: Double
+
+    /// Average brightness of the center-weighted zones (indices 1, 3, 4, 5, 7).
+    let subjectZoneBrightness: Double
+
     /// Human-readable summary for console debugging.
     var debugDescription: String {
-        String(format: "📊 Analysis: Brightness %.3f, Contrast %.4f, Clipping S:%.1f%% H:%.1f%%, Balance R:%.2f G:%.2f B:%.2f",
-               meanBrightness, contrastScore,
-               shadowClipping * 100, highlightClipping * 100,
-               colorBalance["red"] ?? 0, colorBalance["green"] ?? 0, colorBalance["blue"] ?? 0)
+        let zonal = zonalBrightness.map { String(format: "%.2f", $0) }
+        return """
+        📊 Analysis: Brightness \(String(format: "%.3f", meanBrightness)), \
+        Contrast \(String(format: "%.4f", contrastScore)), \
+        Clipping S:\(String(format: "%.1f", shadowClipping * 100))% H:\(String(format: "%.1f", highlightClipping * 100))%
+        📐 Zonal Map:
+          [ \(zonal[0]),  \(zonal[1]),  \(zonal[2]) ]
+          [ \(zonal[3]),  \(zonal[4]),  \(zonal[5]) ]
+          [ \(zonal[6]),  \(zonal[7]),  \(zonal[8]) ]
+        🎯 Subject Zone: \(String(format: "%.3f", subjectZoneBrightness)), Dynamic Range: \(String(format: "%.3f", dynamicRangeDepth))
+        """
     }
 
     /// Formats the stats into a structured block for the enhancement prompt.
     var aiPromptBlock: String {
-        """
+        let z = zonalBrightness.map { String(format: "%.3f", $0) }
+        return """
         HISTOGRAM DATA FOR CURRENT FRAME:
         - Mean Brightness: \(String(format: "%.3f", meanBrightness)) (Target: 0.5)
         - Contrast Score: \(String(format: "%.4f", contrastScore))
         - Shadow Clipping: \(String(format: "%.1f", shadowClipping * 100))% (High values indicate blocked blacks)
         - Highlight Clipping: \(String(format: "%.1f", highlightClipping * 100))% (High values indicate blown skies)
         - Color Balance: R=\(String(format: "%.3f", colorBalance["red"] ?? 0)) G=\(String(format: "%.3f", colorBalance["green"] ?? 0)) B=\(String(format: "%.3f", colorBalance["blue"] ?? 0))
+
+        SPATIAL LIGHT MAP (3x3 Grid, 0.0=black 1.0=white):
+        [ \(z[0]),  \(z[1]),  \(z[2]) ]
+        [ \(z[3]),  \(z[4]),  \(z[5]) ]
+        [ \(z[6]),  \(z[7]),  \(z[8]) ]
+
+        Dynamic Range Depth: \(String(format: "%.3f", dynamicRangeDepth))
+        Subject Area Brightness: \(String(format: "%.3f", subjectZoneBrightness))
         """
     }
 }

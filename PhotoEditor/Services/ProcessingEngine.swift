@@ -163,7 +163,8 @@ final class ProcessingEngine: @unchecked Sendable {
     
     /// Computes precise histogram-derived statistics from the source image.
     /// Uses CIAreaAverage for mean brightness/color and CIAreaHistogram for clipping analysis.
-    /// Operates on a downsampled 512px version for instant performance on M3.
+    /// Includes 3x3 zonal metering for spatial light mapping.
+    /// Operates on a downsampled 512px version for instant performance.
     func calculateStatistics(for ciImage: CIImage) async -> ImageStatistics {
         return await withCheckedContinuation { continuation in
             renderQueue.async { [self] in
@@ -210,6 +211,47 @@ final class ProcessingEngine: @unchecked Sendable {
                     }
                 }
                 
+                // --- 3x3 Zonal Metering via CIAreaAverage per zone ---
+                var zonalBrightness = [Double](repeating: 0.5, count: 9)
+                let zoneWidth = extent.width / 3.0
+                let zoneHeight = extent.height / 3.0
+                
+                for row in 0..<3 {
+                    for col in 0..<3 {
+                        let zoneRect = CGRect(
+                            x: extent.origin.x + CGFloat(col) * zoneWidth,
+                            y: extent.origin.y + CGFloat(2 - row) * zoneHeight, // flip: row 0 = top
+                            width: zoneWidth,
+                            height: zoneHeight
+                        )
+                        
+                        if let zoneFilter = CIFilter(name: "CIAreaAverage") {
+                            zoneFilter.setValue(analysisImage, forKey: kCIInputImageKey)
+                            zoneFilter.setValue(CIVector(cgRect: zoneRect), forKey: kCIInputExtentKey)
+                            
+                            if let zoneOutput = zoneFilter.outputImage {
+                                var zonePixel = [Float](repeating: 0, count: 4)
+                                self.ciContext.render(
+                                    zoneOutput,
+                                    toBitmap: &zonePixel,
+                                    rowBytes: 4 * MemoryLayout<Float>.stride,
+                                    bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                                    format: .RGBAf,
+                                    colorSpace: nil
+                                )
+                                let zoneLum = Double(zonePixel[0]) * 0.2126 +
+                                              Double(zonePixel[1]) * 0.7152 +
+                                              Double(zonePixel[2]) * 0.0722
+                                zonalBrightness[row * 3 + col] = zoneLum
+                            }
+                        }
+                    }
+                }
+                
+                let dynamicRangeDepth = (zonalBrightness.max() ?? 0) - (zonalBrightness.min() ?? 0)
+                // Center-weighted: indices 1(top-center), 3(mid-left), 4(center), 5(mid-right), 7(bottom-center)
+                let subjectZoneBrightness = (zonalBrightness[1] + zonalBrightness[3] + zonalBrightness[4] + zonalBrightness[5] + zonalBrightness[7]) / 5.0
+                
                 // --- Histogram Analysis via CIAreaHistogram (256 bins) ---
                 var shadowClipping: Double = 0.0
                 var highlightClipping: Double = 0.0
@@ -248,7 +290,10 @@ final class ProcessingEngine: @unchecked Sendable {
                             continuation.resume(returning: ImageStatistics(
                                 meanBrightness: meanBrightness, contrastScore: 0,
                                 shadowClipping: 0, highlightClipping: 0,
-                                colorBalance: colorBalance
+                                colorBalance: colorBalance,
+                                zonalBrightness: zonalBrightness,
+                                dynamicRangeDepth: dynamicRangeDepth,
+                                subjectZoneBrightness: subjectZoneBrightness
                             ))
                             return
                         }
@@ -280,7 +325,10 @@ final class ProcessingEngine: @unchecked Sendable {
                     contrastScore: contrastScore,
                     shadowClipping: shadowClipping,
                     highlightClipping: highlightClipping,
-                    colorBalance: colorBalance
+                    colorBalance: colorBalance,
+                    zonalBrightness: zonalBrightness,
+                    dynamicRangeDepth: dynamicRangeDepth,
+                    subjectZoneBrightness: subjectZoneBrightness
                 )
                 
                 continuation.resume(returning: stats)
