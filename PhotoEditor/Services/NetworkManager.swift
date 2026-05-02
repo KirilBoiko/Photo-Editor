@@ -210,6 +210,11 @@ final class NetworkManager: Sendable {
     • UNBALANCED: L/R differ >0.2 → split-the-difference with global.exposure
     • Subject Area <0.35 → lift subject.exposure; >0.65 → protect highlights
 
+    SIGNAL SIGHT (Waveform & Vectorscope):
+    • WAVEFORM: Ensure subject midtones (faces) sit around 60-70% (0.6-0.7) on the waveform.
+    • VECTORSCOPE: Ensure skin tones sit on the skin-tone line. Correct Skew to reach Neutral.
+    • SPREAD: If Spread < 0.2, the light is too concentrated — add global.contrast.
+
     HISTOGRAM RULES:
     • Shadow Clipping >5% → recover with subject/global shadows
     • Highlight Clipping >5% → pull back with background/global highlights

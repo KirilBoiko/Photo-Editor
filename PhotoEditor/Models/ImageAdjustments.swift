@@ -169,6 +169,12 @@ struct ImageStatistics: Codable, Equatable {
     /// Average brightness of the center-weighted zones (indices 1, 3, 4, 5, 7).
     let subjectZoneBrightness: Double
 
+    /// Dominant color lean (e.g., "Red", "Blue", "Neutral").
+    let vectorscopeSkew: String
+
+    /// How evenly the light is spread (0.0–1.0).
+    let waveformSpread: Double
+
     /// Human-readable summary for console debugging.
     var debugDescription: String {
         let zonal = zonalBrightness.map { String(format: "%.2f", $0) }
@@ -181,6 +187,7 @@ struct ImageStatistics: Codable, Equatable {
           [ \(zonal[3]),  \(zonal[4]),  \(zonal[5]) ]
           [ \(zonal[6]),  \(zonal[7]),  \(zonal[8]) ]
         🎯 Subject Zone: \(String(format: "%.3f", subjectZoneBrightness)), Dynamic Range: \(String(format: "%.3f", dynamicRangeDepth))
+        📡 Signal: Skew: \(vectorscopeSkew), Spread: \(String(format: "%.2f", waveformSpread))
         """
     }
 
@@ -202,6 +209,10 @@ struct ImageStatistics: Codable, Equatable {
 
         Dynamic Range Depth: \(String(format: "%.3f", dynamicRangeDepth))
         Subject Area Brightness: \(String(format: "%.3f", subjectZoneBrightness))
+
+        SIGNAL ANALYSIS:
+        - Vectorscope Skew: \(vectorscopeSkew) (Dominant color cast)
+        - Waveform Spread: \(String(format: "%.2f", waveformSpread)) (Light distribution)
         """
     }
 }

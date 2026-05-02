@@ -60,6 +60,16 @@ struct ContentView: View {
                 originalImage: original,
                 processedImage: processed
             )
+            .overlay {
+                // Zebra clipping overlay (red=highlights, blue=shadows)
+                if viewModel.showZebraOverlay, let zebra = viewModel.zebraOverlayImage {
+                    Image(nsImage: zebra)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
             .padding(16)
             .onDrop(of: [.fileURL], isTargeted: $isDragTargeted) { providers in
                 handleDrop(providers)

@@ -114,6 +114,18 @@ struct ToolbarView: View {
             .help("Sync current settings to all photos")
         }
 
+        // Zebra Clipping Overlay
+        Button {
+            viewModel.showZebraOverlay.toggle()
+        } label: {
+            Label("Zebra", systemImage: viewModel.showZebraOverlay ? "eye.trianglebadge.exclamationmark.fill" : "eye.trianglebadge.exclamationmark")
+                .frame(height: 44)
+        }
+        .transaction { $0.animation = nil }
+        .fixedSize()
+        .disabled(viewModel.document == nil)
+        .help("Toggle highlight/shadow clipping overlay")
+
         // Reset
         Button {
             withAnimation(.spring(response: 0.3)) {

@@ -135,6 +135,15 @@ final class PhotoEditorViewModel: ObservableObject {
     /// Real-time histogram data extracted from the rendering pipeline
     @Published var histogramData: ProcessingEngine.HistogramData = .empty
 
+    /// Real-time scope data (waveform + vectorscope)
+    @Published var scopeData: ProcessingEngine.ScopeData = .empty
+
+    /// Whether the zebra clipping overlay is visible on the canvas.
+    @Published var showZebraOverlay: Bool = false
+
+    /// The rendered zebra overlay image (red=highlights, blue=shadows).
+    @Published var zebraOverlayImage: NSImage?
+
     /// True while the enhancement analysis is in flight.
     @Published var isAnalyzing: Bool = false
 
@@ -603,6 +612,24 @@ final class PhotoEditorViewModel: ObservableObject {
             )
             self.processedImage = rendered
             self.histogramData = histogram
+
+            // Generate scope data from the processed CIImage (downsampled for performance)
+            let pipeline = processingEngine.buildFullPipelinePublic(
+                source: document.ciImage,
+                adjustments: currentAdjustments
+            )
+            let scopes = await processingEngine.generateScopes(for: pipeline)
+            self.scopeData = scopes
+
+            // Generate zebra overlay if enabled
+            if showZebraOverlay {
+                if let zebraCIImage = processingEngine.generateZebraOverlay(for: pipeline),
+                   let cgImage = await processingEngine.renderCGImage(from: zebraCIImage) {
+                    self.zebraOverlayImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                }
+            } else {
+                self.zebraOverlayImage = nil
+            }
         } catch {
             showError("Rendering failed: \(error.localizedDescription)")
         }

@@ -30,6 +30,9 @@ struct AdjustmentPanelView: View {
                 HistogramView(data: viewModel.histogramData)
                     .padding(.bottom, 4)
 
+                // MARK: - Scopes (Waveform + Vectorscope)
+                ScopesPanelView(viewModel: viewModel)
+
                 // MARK: - Highlight Warning
                 if let stats = viewModel.lastImageStatistics,
                    stats.highlightClipping > 0.02 {

@@ -36,3 +36,10 @@ extension NSImage {
         return bitmapImage.representation(using: .jpeg, properties: [.compressionFactor: quality])
     }
 }
+
+extension Comparable {
+    /// Clamps the value to the given closed range.
+    func clamped(to range: ClosedRange<Self>) -> Self {
+        min(max(self, range.lowerBound), range.upperBound)
+    }
+}

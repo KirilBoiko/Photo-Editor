@@ -69,6 +69,48 @@ final class ProcessingEngine: @unchecked Sendable {
         )
     }
 
+    // MARK: - Waveform
+
+    /// Luminance waveform: for each column, the distribution of brightness levels.
+    /// `columns` is a 2D array: [columnIndex][binIndex] where bins are 0–255.
+    struct WaveformData: Equatable {
+        var columns: [[CGFloat]]
+        let width: Int
+        let height: Int = 256
+
+        static let empty = WaveformData(columns: [], width: 0)
+    }
+
+    // MARK: - Vectorscope
+
+    /// Vectorscope data: array of (u, v) points in -0.5...0.5 range.
+    /// Center = neutral gray, distance = saturation, angle = hue.
+    struct VectorscopeData: Equatable {
+        var points: [(u: CGFloat, v: CGFloat)]
+        /// Derived: dominant hue direction as a label
+        var skewDescription: String
+
+        static func == (lhs: VectorscopeData, rhs: VectorscopeData) -> Bool {
+            lhs.skewDescription == rhs.skewDescription && lhs.points.count == rhs.points.count
+        }
+
+        static let empty = VectorscopeData(points: [], skewDescription: "Neutral")
+    }
+
+    /// Combined scope output from a single analysis pass.
+    struct ScopeData: Equatable {
+        var waveform: WaveformData
+        var vectorscope: VectorscopeData
+        /// How spread the waveform is: 0 = concentrated, 1 = evenly distributed.
+        var waveformSpread: Double
+
+        static let empty = ScopeData(
+            waveform: .empty,
+            vectorscope: .empty,
+            waveformSpread: 0
+        )
+    }
+
     // MARK: - Initialization
 
     init() {
@@ -159,181 +201,321 @@ final class ProcessingEngine: @unchecked Sendable {
         }
     }
     
+    /// Public access to the full filter pipeline for scope/zebra generation.
+    func buildFullPipelinePublic(source: CIImage, adjustments: ImageAdjustments) -> CIImage {
+        return self.buildFullPipeline(source: source, adjustments: adjustments)
+    }
+
+    /// Renders a CIImage to CGImage on the render queue.
+    func renderCGImage(from ciImage: CIImage) async -> CGImage? {
+        return await withCheckedContinuation { continuation in
+            renderQueue.async { [self] in
+                let result = self.ciContext.createCGImage(ciImage, from: ciImage.extent)
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
     // MARK: - Image Statistics (Mathematical Analysis)
     
     /// Computes precise histogram-derived statistics from the source image.
-    /// Uses CIAreaAverage for mean brightness/color and CIAreaHistogram for clipping analysis.
-    /// Includes 3x3 zonal metering for spatial light mapping.
-    /// Operates on a downsampled 512px version for instant performance.
     func calculateStatistics(for ciImage: CIImage) async -> ImageStatistics {
+        // Downsample to 512px for fast analysis
+        let scaleFilter = CIFilter(name: "CILanczosScaleTransform")!
+        let scale = min(1.0, 512.0 / max(ciImage.extent.width, ciImage.extent.height))
+        scaleFilter.setValue(ciImage, forKey: kCIInputImageKey)
+        scaleFilter.setValue(scale, forKey: kCIInputScaleKey)
+        let analysisImage = scaleFilter.outputImage ?? ciImage
+        let extent = analysisImage.extent
+
         return await withCheckedContinuation { continuation in
             renderQueue.async { [self] in
-                // Downsample to 512px for fast analysis
-                let scaleFilter = CIFilter(name: "CILanczosScaleTransform")!
-                let scale = min(1.0, 512.0 / max(ciImage.extent.width, ciImage.extent.height))
-                scaleFilter.setValue(ciImage, forKey: kCIInputImageKey)
-                scaleFilter.setValue(scale, forKey: kCIInputScaleKey)
-                let analysisImage = scaleFilter.outputImage ?? ciImage
-                let extent = analysisImage.extent
+                // 1. Mean & Color Balance
+                let (meanBrightness, colorBalance) = self.analyzeMeanColor(analysisImage, extent: extent)
                 
-                // --- Mean Brightness & Color Balance via CIAreaAverage ---
-                var meanBrightness: Double = 0.5
-                var colorBalance: [String: Double] = ["red": 0.33, "green": 0.33, "blue": 0.33]
+                // 2. Zonal Metering
+                let zonalBrightness = self.analyzeZones(analysisImage, extent: extent)
                 
-                if let avgFilter = CIFilter(name: "CIAreaAverage") {
-                    avgFilter.setValue(analysisImage, forKey: kCIInputImageKey)
-                    avgFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
-                    
-                    if let avgOutput = avgFilter.outputImage {
-                        var pixel = [Float](repeating: 0, count: 4)
-                        self.ciContext.render(
-                            avgOutput,
-                            toBitmap: &pixel,
-                            rowBytes: 4 * MemoryLayout<Float>.stride,
-                            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-                            format: .RGBAf,
-                            colorSpace: nil
-                        )
-                        
-                        let r = Double(pixel[0])
-                        let g = Double(pixel[1])
-                        let b = Double(pixel[2])
-                        
-                        // ITU-R BT.709 luminance
-                        meanBrightness = r * 0.2126 + g * 0.7152 + b * 0.0722
-                        
-                        let total = max(r + g + b, 0.001)
-                        colorBalance = [
-                            "red": r / total,
-                            "green": g / total,
-                            "blue": b / total
-                        ]
-                    }
-                }
+                // 3. Histogram-based stats (clipping, contrast)
+                let (contrast, shadowClip, highlightClip) = self.analyzeHistogram(analysisImage, extent: extent)
                 
-                // --- 3x3 Zonal Metering via CIAreaAverage per zone ---
-                var zonalBrightness = [Double](repeating: 0.5, count: 9)
-                let zoneWidth = extent.width / 3.0
-                let zoneHeight = extent.height / 3.0
+                // 4. Signal Analysis
+                let drDepth = (zonalBrightness.max() ?? 0) - (zonalBrightness.min() ?? 0)
+                let subZone = (zonalBrightness[1] + zonalBrightness[3] + zonalBrightness[4] + zonalBrightness[5] + zonalBrightness[7]) / 5.0
                 
-                for row in 0..<3 {
-                    for col in 0..<3 {
-                        let zoneRect = CGRect(
-                            x: extent.origin.x + CGFloat(col) * zoneWidth,
-                            y: extent.origin.y + CGFloat(2 - row) * zoneHeight, // flip: row 0 = top
-                            width: zoneWidth,
-                            height: zoneHeight
-                        )
-                        
-                        if let zoneFilter = CIFilter(name: "CIAreaAverage") {
-                            zoneFilter.setValue(analysisImage, forKey: kCIInputImageKey)
-                            zoneFilter.setValue(CIVector(cgRect: zoneRect), forKey: kCIInputExtentKey)
-                            
-                            if let zoneOutput = zoneFilter.outputImage {
-                                var zonePixel = [Float](repeating: 0, count: 4)
-                                self.ciContext.render(
-                                    zoneOutput,
-                                    toBitmap: &zonePixel,
-                                    rowBytes: 4 * MemoryLayout<Float>.stride,
-                                    bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-                                    format: .RGBAf,
-                                    colorSpace: nil
-                                )
-                                let zoneLum = Double(zonePixel[0]) * 0.2126 +
-                                              Double(zonePixel[1]) * 0.7152 +
-                                              Double(zonePixel[2]) * 0.0722
-                                zonalBrightness[row * 3 + col] = zoneLum
-                            }
-                        }
-                    }
-                }
-                
-                let dynamicRangeDepth = (zonalBrightness.max() ?? 0) - (zonalBrightness.min() ?? 0)
-                // Center-weighted: indices 1(top-center), 3(mid-left), 4(center), 5(mid-right), 7(bottom-center)
-                let subjectZoneBrightness = (zonalBrightness[1] + zonalBrightness[3] + zonalBrightness[4] + zonalBrightness[5] + zonalBrightness[7]) / 5.0
-                
-                // --- Histogram Analysis via CIAreaHistogram (256 bins) ---
-                var shadowClipping: Double = 0.0
-                var highlightClipping: Double = 0.0
-                var contrastScore: Double = 0.0
-                
-                if let histFilter = CIFilter(name: "CIAreaHistogram") {
-                    histFilter.setValue(analysisImage, forKey: kCIInputImageKey)
-                    histFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
-                    histFilter.setValue(256, forKey: "inputCount")
-                    histFilter.setValue(1.0, forKey: "inputScale")
-                    
-                    if let histOutput = histFilter.outputImage {
-                        var bins = [SIMD4<Float>](repeating: .zero, count: 256)
-                        self.ciContext.render(
-                            histOutput,
-                            toBitmap: &bins,
-                            rowBytes: 256 * MemoryLayout<SIMD4<Float>>.stride,
-                            bounds: CGRect(x: 0, y: 0, width: 256, height: 1),
-                            format: .RGBAf,
-                            colorSpace: nil
-                        )
-                        
-                        // Compute luminance histogram from RGB bins
-                        var lumBins = [Double](repeating: 0, count: 256)
-                        var totalPixels: Double = 0
-                        
-                        for i in 0..<256 {
-                            let lum = Double(bins[i].x) * 0.2126 +
-                                      Double(bins[i].y) * 0.7152 +
-                                      Double(bins[i].z) * 0.0722
-                            lumBins[i] = lum
-                            totalPixels += lum
-                        }
-                        
-                        guard totalPixels > 0 else {
-                            continuation.resume(returning: ImageStatistics(
-                                meanBrightness: meanBrightness, contrastScore: 0,
-                                shadowClipping: 0, highlightClipping: 0,
-                                colorBalance: colorBalance,
-                                zonalBrightness: zonalBrightness,
-                                dynamicRangeDepth: dynamicRangeDepth,
-                                subjectZoneBrightness: subjectZoneBrightness
-                            ))
-                            return
-                        }
-                        
-                        // Shadow clipping: bins 0–12 (~0.0–0.05 range)
-                        let shadowBins = lumBins[0..<13].reduce(0, +)
-                        shadowClipping = shadowBins / totalPixels
-                        
-                        // Highlight clipping: bins 243–255 (~0.95–1.0 range)
-                        let highlightBins = lumBins[243..<256].reduce(0, +)
-                        highlightClipping = highlightBins / totalPixels
-                        
-                        // Contrast score: variance of luminance distribution
-                        var mean: Double = 0
-                        for i in 0..<256 {
-                            mean += (Double(i) / 255.0) * (lumBins[i] / totalPixels)
-                        }
-                        var variance: Double = 0
-                        for i in 0..<256 {
-                            let diff = (Double(i) / 255.0) - mean
-                            variance += diff * diff * (lumBins[i] / totalPixels)
-                        }
-                        contrastScore = variance
-                    }
-                }
-                
+                let rBal = colorBalance["red"] ?? 0.33
+                let bBal = colorBalance["blue"] ?? 0.33
+                let y = 0.2126 * rBal + 0.7152 * (colorBalance["green"] ?? 0.33) + 0.0722 * bBal
+                let cb = (bBal - y) * 0.5389
+                let cr = (rBal - y) * 0.6350
+                let skewAngle = atan2(cr, cb) * 180.0 / .pi
+                let skewDescription = sqrt(cb*cb + cr*cr) < 0.01 ? "Neutral" : Self.hueLabel(for: Double(skewAngle))
+                let spread = (contrast * 10.0).clamped(to: 0...1)
+
                 let stats = ImageStatistics(
                     meanBrightness: meanBrightness,
-                    contrastScore: contrastScore,
-                    shadowClipping: shadowClipping,
-                    highlightClipping: highlightClipping,
+                    contrastScore: contrast,
+                    shadowClipping: shadowClip,
+                    highlightClipping: highlightClip,
                     colorBalance: colorBalance,
                     zonalBrightness: zonalBrightness,
-                    dynamicRangeDepth: dynamicRangeDepth,
-                    subjectZoneBrightness: subjectZoneBrightness
+                    dynamicRangeDepth: drDepth,
+                    subjectZoneBrightness: subZone,
+                    vectorscopeSkew: skewDescription,
+                    waveformSpread: spread
                 )
                 
                 continuation.resume(returning: stats)
             }
         }
+    }
+
+    private func analyzeMeanColor(_ image: CIImage, extent: CGRect) -> (Double, [String: Double]) {
+        guard let avgFilter = CIFilter(name: "CIAreaAverage") else { return (0.5, ["red": 0.33, "green": 0.33, "blue": 0.33]) }
+        avgFilter.setValue(image, forKey: kCIInputImageKey)
+        avgFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
+        
+        guard let output = avgFilter.outputImage else { return (0.5, [:]) }
+        var pixel = [Float](repeating: 0, count: 4)
+        self.ciContext.render(output, toBitmap: &pixel, rowBytes: 4 * MemoryLayout<Float>.stride, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+        
+        let r = Double(pixel[0]), g = Double(pixel[1]), b = Double(pixel[2])
+        let lum = r * 0.2126 + g * 0.7152 + b * 0.0722
+        let total = max(r + g + b, 0.001)
+        return (lum, ["red": r / total, "green": g / total, "blue": b / total])
+    }
+
+    private func analyzeZones(_ image: CIImage, extent: CGRect) -> [Double] {
+        var zones = [Double](repeating: 0.5, count: 9)
+        let zW = extent.width / 3.0, zH = extent.height / 3.0
+        
+        for row in 0..<3 {
+            for col in 0..<3 {
+                let rect = CGRect(x: extent.origin.x + CGFloat(col) * zW, y: extent.origin.y + CGFloat(2 - row) * zH, width: zW, height: zH)
+                if let f = CIFilter(name: "CIAreaAverage") {
+                    f.setValue(image, forKey: kCIInputImageKey)
+                    f.setValue(CIVector(cgRect: rect), forKey: kCIInputExtentKey)
+                    if let out = f.outputImage {
+                        var p = [Float](repeating: 0, count: 4)
+                        self.ciContext.render(out, toBitmap: &p, rowBytes: 4 * MemoryLayout<Float>.stride, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+                        zones[row * 3 + col] = Double(p[0]) * 0.2126 + Double(p[1]) * 0.7152 + Double(p[2]) * 0.0722
+                    }
+                }
+            }
+        }
+        return zones
+    }
+
+    private func analyzeHistogram(_ image: CIImage, extent: CGRect) -> (Double, Double, Double) {
+        guard let f = CIFilter(name: "CIAreaHistogram") else { return (0, 0, 0) }
+        f.setValue(image, forKey: kCIInputImageKey)
+        f.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
+        f.setValue(256, forKey: "inputCount")
+        
+        guard let out = f.outputImage else { return (0, 0, 0) }
+        var bins = [SIMD4<Float>](repeating: .zero, count: 256)
+        self.ciContext.render(out, toBitmap: &bins, rowBytes: 256 * MemoryLayout<SIMD4<Float>>.stride, bounds: CGRect(x: 0, y: 0, width: 256, height: 1), format: .RGBAf, colorSpace: nil)
+        
+        var lumBins = [Double](repeating: 0, count: 256)
+        var total: Double = 0
+        for i in 0..<256 {
+            let l = Double(bins[i].x) * 0.2126 + Double(bins[i].y) * 0.7152 + Double(bins[i].z) * 0.0722
+            lumBins[i] = l
+            total += l
+        }
+        guard total > 0 else { return (0, 0, 0) }
+        
+        let shadow = lumBins[0..<13].reduce(0, +) / total
+        let highlight = lumBins[243..<256].reduce(0, +) / total
+        
+        var mean: Double = 0
+        for i in 0..<256 { mean += (Double(i) / 255.0) * (lumBins[i] / total) }
+        var variance: Double = 0
+        for i in 0..<256 {
+            let d = (Double(i) / 255.0) - mean
+            variance += d * d * (lumBins[i] / total)
+        }
+        return (variance, shadow, highlight)
+    }
+
+    // MARK: - Scope Analysis (Waveform + Vectorscope)
+
+    /// Generates waveform and vectorscope data from a downsampled version of the image.
+    /// Runs on the render queue for GPU performance.
+    func generateScopes(for ciImage: CIImage) async -> ScopeData {
+        return await withCheckedContinuation { continuation in
+            renderQueue.async { [self] in
+                // Downsample to 256px for real-time performance
+                let scaleFilter = CIFilter(name: "CILanczosScaleTransform")!
+                let scale = min(1.0, 256.0 / max(ciImage.extent.width, ciImage.extent.height))
+                scaleFilter.setValue(ciImage, forKey: kCIInputImageKey)
+                scaleFilter.setValue(scale, forKey: kCIInputScaleKey)
+                guard let small = scaleFilter.outputImage else {
+                    continuation.resume(returning: .empty)
+                    return
+                }
+
+                let extent = small.extent
+                let w = Int(extent.width)
+                let h = Int(extent.height)
+                guard w > 0 && h > 0 else {
+                    continuation.resume(returning: .empty)
+                    return
+                }
+
+                // Render to RGBA float bitmap
+                var pixels = [Float](repeating: 0, count: w * h * 4)
+                self.ciContext.render(
+                    small,
+                    toBitmap: &pixels,
+                    rowBytes: w * 4 * MemoryLayout<Float>.stride,
+                    bounds: extent,
+                    format: .RGBAf,
+                    colorSpace: nil
+                )
+
+                // --- Waveform: luminance distribution per column ---
+                let waveformCols = 128  // output resolution
+                let colStep = max(1, w / waveformCols)
+                var wfColumns = [[CGFloat]](repeating: [CGFloat](repeating: 0, count: 256), count: waveformCols)
+
+                for col in 0..<waveformCols {
+                    let srcCol = min(col * colStep, w - 1)
+                    for row in 0..<h {
+                        let idx = (row * w + srcCol) * 4
+                        let r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2]
+                        let lum = Float(r) * 0.2126 + Float(g) * 0.7152 + Float(b) * 0.0722
+                        let bin = min(255, max(0, Int(lum * 255.0)))
+                        wfColumns[col][bin] += 1.0
+                    }
+                    // Normalize column
+                    let maxVal = wfColumns[col].max() ?? 1.0
+                    if maxVal > 0 {
+                        for bin in 0..<256 {
+                            wfColumns[col][bin] /= maxVal
+                        }
+                    }
+                }
+
+                // Waveform spread: how evenly distributed the luminance is
+                var totalLum: [Double] = Array(repeating: 0, count: 256)
+                for col in wfColumns { for bin in 0..<256 { totalLum[bin] += Double(col[bin]) } }
+                let totalSum = totalLum.reduce(0, +)
+                var spread: Double = 0
+                if totalSum > 0 {
+                    let normalized = totalLum.map { $0 / totalSum }
+                    let uniform = 1.0 / 256.0
+                    let deviation = normalized.map { abs($0 - uniform) }.reduce(0, +) / 2.0
+                    spread = 1.0 - deviation  // 1.0 = perfectly even
+                }
+
+                // --- Vectorscope: U/V scatter ---
+                let sampleStep = max(1, (w * h) / 4096)  // sample ~4096 pixels
+                var vsPoints: [(u: CGFloat, v: CGFloat)] = []
+                var uSum: Double = 0, vSum: Double = 0
+
+                for i in stride(from: 0, to: w * h, by: sampleStep) {
+                    let idx = i * 4
+                    let r = CGFloat(pixels[idx])
+                    let g = CGFloat(pixels[idx + 1])
+                    let b = CGFloat(pixels[idx + 2])
+
+                    // YCbCr conversion (BT.709)
+                    let y  =  0.2126 * r + 0.7152 * g + 0.0722 * b
+                    let cb = (b - y) * 0.5389
+                    let cr = (r - y) * 0.6350
+
+                    let u = cb.clamped(to: -0.5...0.5)
+                    let v = cr.clamped(to: -0.5...0.5)
+                    vsPoints.append((u: u, v: v))
+                    uSum += Double(u)
+                    vSum += Double(v)
+                }
+
+                // Determine skew direction
+                let count = Double(vsPoints.count)
+                let avgU = count > 0 ? uSum / count : 0
+                let avgV = count > 0 ? vSum / count : 0
+                let skewAngle = atan2(avgV, avgU) * 180.0 / .pi
+                let skewMag = sqrt(avgU * avgU + avgV * avgV)
+                let skewLabel = skewMag < 0.01 ? "Neutral" : Self.hueLabel(for: skewAngle)
+
+                let waveform = WaveformData(columns: wfColumns, width: waveformCols)
+                let vectorscope = VectorscopeData(points: vsPoints, skewDescription: skewLabel)
+
+                continuation.resume(returning: ScopeData(
+                    waveform: waveform,
+                    vectorscope: vectorscope,
+                    waveformSpread: spread
+                ))
+            }
+        }
+    }
+
+    /// Maps a Cb/Cr angle (degrees) to a human-readable color direction.
+    private static func hueLabel(for angle: Double) -> String {
+        let a = angle < 0 ? angle + 360 : angle
+        switch a {
+        case 0..<30, 330..<360: return "Red"
+        case 30..<60:           return "Orange"
+        case 60..<90:           return "Yellow"
+        case 90..<150:          return "Green"
+        case 150..<210:         return "Cyan"
+        case 210..<270:         return "Blue"
+        case 270..<330:         return "Magenta"
+        default:                return "Neutral"
+        }
+    }
+
+    // MARK: - Zebra Overlay (Clipping Indicators)
+
+    /// Generates a CIImage overlay with red for blown highlights (>0.98) and blue for crushed blacks (<0.02).
+    /// Uses CIFilter math on the GPU for real-time performance.
+    func generateZebraOverlay(for ciImage: CIImage) -> CIImage? {
+        let extent = ciImage.extent
+
+        // Convert to luminance using CIColorMatrix
+        guard let lumFilter = CIFilter(name: "CIColorMatrix") else { return nil }
+        lumFilter.setValue(ciImage, forKey: kCIInputImageKey)
+        // BT.709 coefficients in the R channel, zero out G,B,A for a grayscale result
+        lumFilter.setValue(CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0), forKey: "inputRVector")
+        lumFilter.setValue(CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0), forKey: "inputGVector")
+        lumFilter.setValue(CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0), forKey: "inputBVector")
+        lumFilter.setValue(CIVector(x: 0, y: 0, z: 0, w: 1), forKey: "inputAVector")
+        guard let lumImage = lumFilter.outputImage else { return nil }
+
+        // Highlight zebra: pixels where luminance > 0.98
+        let highlightKernel = CIColorKernel(source: """
+            kernel vec4 highlightZebra(sample s) {
+                float lum = s.r;
+                if (lum > 0.98) {
+                    return vec4(1.0, 0.0, 0.0, 0.6);
+                }
+                return vec4(0.0, 0.0, 0.0, 0.0);
+            }
+        """)
+
+        // Shadow zebra: pixels where luminance < 0.02
+        let shadowKernel = CIColorKernel(source: """
+            kernel vec4 shadowZebra(sample s) {
+                float lum = s.r;
+                if (lum < 0.02) {
+                    return vec4(0.0, 0.2, 1.0, 0.6);
+                }
+                return vec4(0.0, 0.0, 0.0, 0.0);
+            }
+        """)
+
+        let highlightOverlay = highlightKernel?.apply(extent: extent, arguments: [lumImage])
+        let shadowOverlay = shadowKernel?.apply(extent: extent, arguments: [lumImage])
+
+        // Composite both overlays
+        guard let hlOverlay = highlightOverlay, let shOverlay = shadowOverlay else { return nil }
+
+        let composite = CIFilter(name: "CISourceOverCompositing")!
+        composite.setValue(hlOverlay, forKey: kCIInputImageKey)
+        composite.setValue(shOverlay, forKey: kCIInputBackgroundImageKey)
+        return composite.outputImage
     }
     
     // MARK: - Histogram Generation
